@@ -79,6 +79,9 @@ BATCH_SIZE = 64
 WEIGHT_DECAY = 1e-4
 MAX_GRAD_NORM = 1.0
 PUSH_MODEL_WEIGHTS = False   # the repo is public; weights stay local
+# --protocol paper: True feeds the model the paper's Min-Max[-1,1] values exactly
+# (unstable for the CNN-LSTM); False maps the same rows back to kWh and uses log scaling.
+PAPER_KEEP_MINMAX = False
 
 # Recommended defaults (the v1 originals are in the ablation list below)
 # Chosen by VALIDATION AUC in the ablation (cnnlstm + minmax_col: val AUC 0.818).
@@ -160,6 +163,115 @@ def load_raw(path):
     return df[CONS_COL].astype(str).to_numpy(), X, mask, df[LABEL_COL].to_numpy(np.int64), cols
 
 
+# ─────────────────────────────────────────────
+# Evaluation protocols
+# ─────────────────────────────────────────────
+def _read_raw_full(path):
+    df = pd.read_csv(path).drop_duplicates()
+    df = df.drop_duplicates(subset=[CONS_COL]).reset_index(drop=True)
+    cols = sorted_date_cols(df.columns)
+    V = df[cols].to_numpy(np.float64)
+    V[V < 0] = np.nan
+    return df[CONS_COL].astype(str).to_numpy(), V, df[LABEL_COL].to_numpy(np.int64), cols
+
+
+def _split(y):
+    idx = np.arange(len(y))
+    i_trv, i_te = train_test_split(idx, test_size=0.2, stratify=y, random_state=SEED)
+    i_tr, i_va = train_test_split(i_trv, test_size=0.2, stratify=y[i_trv], random_state=SEED)
+    return i_tr, i_va, i_te
+
+
+def build_paper_protocol(path):
+    """Elshennawy et al. 2025, Algorithm 1, step by step:
+    1. fill missing values with the (column) mode
+    2. Min-Max scale to [-1, 1] using ALL customers
+    3. oversample theft to 50/50 (paper: LoRAS; here: SMOTE, which also makes
+       synthetic thieves as convex combinations of neighbouring real thieves)
+    4. THEN split 80/20 train/test and 80/20 train/val.
+    Step 3 before step 4 puts synthetic thieves, built from training thieves,
+    into the test set. Rows whose ID starts with 'SYN_' are synthetic."""
+    from imblearn.over_sampling import SMOTE
+    ids, V, y, cols = _read_raw_full(path)
+    print("  paper protocol: mode fill -> Min-Max[-1,1] on all rows -> SMOTE on all rows -> split")
+    modes = pd.DataFrame(V).mode(axis=0, dropna=True).iloc[0].to_numpy()
+    modes = np.where(np.isnan(modes), 0.0, modes)
+    V = np.where(np.isnan(V), modes[None, :], V)
+    lo, hi = V.min(0), V.max(0)
+    rng = np.where(hi - lo == 0, 1.0, hi - lo)
+    X = (2.0 * (V - lo) / rng - 1.0).astype(np.float32)
+    Xr, yr = SMOTE(random_state=SEED).fit_resample(X, y)
+    n_syn = len(yr) - len(y)
+    ids = np.concatenate([ids, np.array([f"SYN_{i}" for i in range(n_syn)])])
+    mask = np.zeros_like(Xr, dtype=np.float32)
+    if PAPER_KEEP_MINMAX:
+        return ids, Xr.astype(np.float32), mask, yr.astype(np.int64), cols, _split(yr), "none"
+    # Same synthetic customers, mapped back to kWh so the model gets log scaling.
+    # Min-Max over all rows squashes ~99% of SGCC values to about -1, which made
+    # training unstable (BatchNorm statistics break); see README.
+    Xk = ((Xr + 1.0) / 2.0 * rng + lo).astype(np.float32)
+    return ids, Xk, mask, yr.astype(np.int64), cols, _split(yr), "log_global"
+
+
+def build_full_protocol(path):
+    """Leak-free, all 42,372 customers: split the REAL customers first, then
+    SMOTE the training rows only. Validation and test stay real and imbalanced
+    (~8.5% theft), like a real utility. Rows whose ID starts with 'SYN_' are synthetic."""
+    from imblearn.over_sampling import SMOTE
+    ids, V, y, cols = _read_raw_full(path)
+    print("  full protocol: all customers, split first, SMOTE on training rows only")
+    mask = np.isnan(V).astype(np.float32)
+    X = pd.DataFrame(V.T).interpolate(limit_direction="both").T.fillna(0.0).to_numpy(np.float32)
+    i_tr, i_va, i_te = _split(y)
+    Z = np.concatenate([X[i_tr], mask[i_tr]], axis=1)
+    Zr, yr = SMOTE(random_state=SEED).fit_resample(Z, y[i_tr])
+    syn = Zr[len(i_tr):]
+    n_syn = len(syn)
+    T = X.shape[1]
+    X = np.concatenate([X, syn[:, :T].astype(np.float32)])
+    mask = np.concatenate([mask, (syn[:, T:] > 0.5).astype(np.float32)])
+    y = np.concatenate([y, yr[len(i_tr):]]).astype(np.int64)
+    ids = np.concatenate([ids, np.array([f"SYN_{i}" for i in range(n_syn)])])
+    i_tr = np.concatenate([i_tr, np.arange(len(ids) - n_syn, len(ids))])
+    return ids, X, mask, y, cols, (i_tr, i_va, i_te), None
+
+
+def subset_report(run_dir, protocol):
+    """Score the saved test predictions on the subsets that matter."""
+    tp = pd.read_csv(run_dir / "test_predictions.csv", dtype={"CONS_NO": str})
+    thr = float(json.loads((run_dir / "model_config.json").read_text())["threshold"])
+    syn = tp.CONS_NO.str.startswith("SYN_").to_numpy()
+    yt, pt = tp.true_label.to_numpy(), tp.theft_probability.to_numpy()
+    out = {"n_test": int(len(tp)), "n_test_synthetic": int(syn.sum())}
+
+    def add(name, keep):
+        m = metrics_at(yt[keep], pt[keep], thr)
+        m["n"] = int(keep.sum())
+        m["n_theft"] = int(yt[keep].sum())
+        out[name] = m
+
+    add("all_test_rows", np.ones(len(tp), bool))
+    real = ~syn
+    add("real_customers_only", real)
+    rng = np.random.RandomState(SEED)
+    th = np.flatnonzero(real & (yt == 1))
+    no = np.flatnonzero(real & (yt == 0))
+    bal = np.zeros(len(tp), bool)
+    bal[th] = True
+    bal[rng.choice(no, size=min(len(th), len(no)), replace=False)] = True
+    add("real_customers_balanced_50_50", bal)
+    if protocol == "paper":
+        add("synthetic_thieves_plus_real_normals", syn | (yt == 0))
+    (run_dir / "subset_results.json").write_text(json.dumps(out, indent=2), encoding="utf-8")
+    print(f"\nTest subsets (threshold {thr:.3f} from validation):")
+    print(f"  {'subset':<38}{'n':>7}{'theft':>7}{'acc':>7}{'F1':>7}{'AUC':>7}{'MCC':>7}")
+    for k, v in out.items():
+        if isinstance(v, dict):
+            print(f"  {k:<38}{v['n']:>7}{v['n_theft']:>7}{v['accuracy']:>7.3f}{v['f1']:>7.3f}"
+                  f"{v['auc']:>7.3f}{v['mcc']:>7.3f}")
+    return out
+
+
 class Scaler:
     """minmax_col: v1 column-wise [-1, 1] (fit on train).
     log_global: log1p(kWh), then one mean/std from the train rows (keeps each customer's level).
@@ -170,7 +282,9 @@ class Scaler:
         self.state = {}
 
     def fit(self, X):
-        if self.kind == "minmax_col":
+        if self.kind == "none":
+            self.state = {}
+        elif self.kind == "minmax_col":
             lo, hi = X.min(0), X.max(0)
             rng = hi - lo
             rng[rng == 0] = 1.0
@@ -185,6 +299,8 @@ class Scaler:
 
     def transform(self, X):
         """Return (series (N, T), customer-level scalars (N, 2))."""
+        if self.kind == "none":   # data already scaled (paper protocol)
+            return np.asarray(X, np.float32), np.zeros((len(X), 2), np.float32)
         if self.kind == "minmax_col":
             S = 2.0 * (X - self.state["min"]) / self.state["range"] - 1.0
             return S.astype(np.float32), np.zeros((len(X), 2), np.float32)
@@ -404,9 +520,12 @@ def train_one(name, cfg, data, device, out_dir):
 def main():
     ap = argparse.ArgumentParser(description="Train the v2 LSTM theft detector")
     ap.add_argument("--source", choices=["raw", "imputed"], default=DEFAULTS["source"])
+    ap.add_argument("--protocol", choices=["balanced", "paper", "full"], default="balanced",
+                    help="balanced: 50/50 real customers (default). paper: reproduce the paper "
+                         "(oversample BEFORE splitting, leaky). full: all customers, SMOTE on train only")
     ap.add_argument("--data", default=None, help="path to data.csv (raw) or imputed_data.csv")
     ap.add_argument("--arch", choices=["cnnlstm", "paper"], default=DEFAULTS["arch"])
-    ap.add_argument("--scaling", choices=["log_global", "log_customer", "minmax_col"], default=DEFAULTS["scaling"])
+    ap.add_argument("--scaling", choices=["log_global", "log_customer", "minmax_col", "none"], default=DEFAULTS["scaling"])
     ap.add_argument("--lr", type=float, default=DEFAULTS["lr"])
     ap.add_argument("--select", choices=["auc", "mcc", "f1"], default=DEFAULTS["select"])
     ap.add_argument("--epochs", type=int, default=DEFAULTS["epochs"])
@@ -429,18 +548,24 @@ def main():
     if path is None or not path.exists():
         raise SystemExit(f"[ERROR] data file for --source {args.source} not found "
                          f"(raw: run 01_download_data.py; imputed: run 02_preprocess.py), or pass --data.")
-    print(f"\nLoading {path} (source={args.source}) ...")
-    ids, X, mask, y, cols = (load_raw if args.source == "raw" else load_imputed)(path)
-    print(f"  customers={len(y)}  days={len(cols)}  theft={int(y.sum())}  normal={int((y == 0).sum())}"
+    print(f"\nLoading {path} (source={args.source}, protocol={args.protocol}) ...")
+    if args.protocol != "balanced":
+        if args.source != "raw":
+            raise SystemExit("[ERROR] --protocol paper/full need --source raw (data/data.csv).")
+        builder = build_paper_protocol if args.protocol == "paper" else build_full_protocol
+        ids, X, mask, y, cols, (i_tr, i_va, i_te), forced_scaling = builder(path)
+        if forced_scaling:
+            args.scaling = forced_scaling
+    else:
+        ids, X, mask, y, cols = (load_raw if args.source == "raw" else load_imputed)(path)
+        i_tr, i_va, i_te = _split(y)
+    print(f"  rows={len(y)} (synthetic={int(sum(i.startswith('SYN_') for i in ids))})  days={len(cols)}"
+          f"  theft={int(y.sum())}  normal={int((y == 0).sum())}"
           f"  missing-day channel={'yes' if mask.any() else 'no'}")
-
-    idx = np.arange(len(y))
-    i_trv, i_te = train_test_split(idx, test_size=0.2, stratify=y, random_state=SEED)
-    i_tr, i_va = train_test_split(i_trv, test_size=0.2, stratify=y[i_trv], random_state=SEED)
     print(f"  split train={len(i_tr)} val={len(i_va)} test={len(i_te)} (stratified, seed {SEED})")
     data = (ids, X, mask, y, cols, (i_tr, i_va, i_te))
 
-    root = OUT_ROOT / args.source
+    root = OUT_ROOT / args.source if args.protocol == "balanced" else OUT_ROOT / f"protocol_{args.protocol}"
     pushed = []
     if args.ablation:
         rows = []
@@ -476,11 +601,15 @@ def main():
         run_dir = root / name
         pushed = [run_dir / f for f in ("test_results.json", "model_config.json", "training_log.csv",
                                         "test_predictions.csv", "val_predictions.csv", "splits.json")]
+        if args.protocol != "balanced":
+            subset_report(run_dir, args.protocol)
+            pushed.append(run_dir / "subset_results.json")
         if PUSH_MODEL_WEIGHTS:
             pushed.append(run_dir / "best_model.pt")
         t = res["tuned_threshold"]
-        msg = f"LSTM v2 {name} ({args.source}): test F1={t['f1']:.3f} AUC={t['auc']:.3f} MCC={t['mcc']:.3f}"
-        run_label = f"lstm-hybrid-v2-{args.source}-{name}"
+        msg = f"LSTM v2 {name} ({args.source}, {args.protocol}): test F1={t['f1']:.3f} AUC={t['auc']:.3f} MCC={t['mcc']:.3f}"
+        run_label = (f"lstm-hybrid-v2-{args.source}-{name}" if args.protocol == "balanced"
+                     else f"lstm-hybrid-v2-protocol-{args.protocol}-{name}")
 
     if not args.no_push:
         try:
