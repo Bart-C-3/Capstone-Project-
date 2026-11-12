@@ -1,8 +1,10 @@
 """
 Hybrid pipeline, Step 7: run everything with one command
 ========================================================
-  1. 11_train_lstm_detector_v2.py   LSTM makes the theft decisions
-  2. 12_explain_hybrid.py           evidence JSON + LLM narration + guardrails
+  1. 11_train_lstm_detector_v2.py   trains the LSTM
+  2. 14_gbm_ensemble.py             LightGBM + LSTM ensemble = the decision-maker
+                                    (skipped with --no-ensemble or --source imputed)
+  3. 12_explain_hybrid.py           evidence JSON + LLM narration + guardrails
 
 Usage
     python 13_run_hybrid_pipeline.py                      train, then explain top 20 flags
@@ -33,6 +35,7 @@ def main():
     ap.add_argument("--skip-train", action="store_true")
     ap.add_argument("--top-n", type=int, default=20)
     ap.add_argument("--no-llm", action="store_true")
+    ap.add_argument("--no-ensemble", action="store_true", help="explain the LSTM alone")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--allow-cpu", action="store_true")
     args, train_extra = ap.parse_known_args()
@@ -43,9 +46,14 @@ def main():
         run([py, "11_train_lstm_detector_v2.py", "--source", args.source, "--run-name", args.run_name]
             + (["--allow-cpu"] if args.allow_cpu else []) + common + train_extra)
     run_dir = SCRIPT_DIR / "data" / "lstm-hybrid-v2" / args.source / args.run_name
+    ensemble = not args.no_ensemble and args.source == "raw"
+    if ensemble:
+        run([py, "14_gbm_ensemble.py", "--lstm-run", str(run_dir)] + common)
     run([py, "12_explain_hybrid.py", "--run-dir", str(run_dir), "--source", args.source,
-         "--top-n", str(args.top_n)] + (["--no-llm"] if args.no_llm else []) + common)
-    print(f"\nDone. Decisions: {run_dir / 'test_predictions.csv'}")
+         "--top-n", str(args.top_n), "--mode", "ensemble" if ensemble else "lstm"]
+        + (["--no-llm"] if args.no_llm else []) + common)
+    decisions = run_dir / "ensemble" / "test_predictions.csv" if ensemble else run_dir / "test_predictions.csv"
+    print(f"\nDone. Decisions: {decisions}")
     print(f"      Explanations: {run_dir / 'explanations' / 'explanations.md'}")
 
 

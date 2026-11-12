@@ -1,70 +1,75 @@
 {
-  "customer_id": "0202763E405F201A253DE281C98E8242",
+  "customer_id": "09120FE02B08469FD40098BB4FE13B68",
   "decision": "flagged as possible electricity theft",
-  "decided_by": "LSTM detector (the language model does not change this)",
-  "theft_probability": 0.99,
-  "decision_threshold": 0.53,
+  "decided_by": "average of an LSTM model (reads the daily usage curve) and a LightGBM model (reads summary features); the language model does not change this",
+  "theft_probability": 0.98,
+  "decision_threshold": 0.41,
   "suspicious_periods": [
-    {
-      "start_date": "2014-05-21",
-      "end_date": "2014-06-17",
-      "theft_probability_if_period_looked_normal": 0.97,
-      "average daily use in this period (kWh)": 20.53,
-      "customer's overall average daily use (kWh)": 19.66,
-      "missing readings in this period (days)": 10
-    },
     {
       "start_date": "2014-08-13",
       "end_date": "2014-09-09",
-      "theft_probability_if_period_looked_normal": 0.98,
-      "average daily use in this period (kWh)": 29.92,
-      "customer's overall average daily use (kWh)": 19.66,
-      "missing readings in this period (days)": 23
+      "lstm_theft_probability_if_period_looked_normal": 0.99,
+      "average daily use in this period (kWh)": 11.66,
+      "customer's overall average daily use (kWh)": 18.55,
+      "missing readings in this period (days)": 2
+    },
+    {
+      "start_date": "2014-09-10",
+      "end_date": "2014-10-07",
+      "lstm_theft_probability_if_period_looked_normal": 0.99,
+      "average daily use in this period (kWh)": 11.03,
+      "customer's overall average daily use (kWh)": 18.55,
+      "missing readings in this period (days)": 1
     },
     {
       "start_date": "2016-09-07",
       "end_date": "2016-10-05",
-      "theft_probability_if_period_looked_normal": 0.98,
-      "average daily use in this period (kWh)": 30.22,
-      "customer's overall average daily use (kWh)": 19.66,
-      "missing readings in this period (days)": 6
+      "lstm_theft_probability_if_period_looked_normal": 0.99,
+      "average daily use in this period (kWh)": 33.87,
+      "customer's overall average daily use (kWh)": 18.55,
+      "missing readings in this period (days)": 1
     }
   ],
-  "comparison_with_normal_customers": [
+  "lstm_theft_probability": 0.99,
+  "feature_model_theft_probability": 0.96,
+  "features_that_pushed_toward_theft": [
     {
-      "feature": "average daily use in the last 90 days (kWh)",
-      "customer_value": 28.5,
-      "typical_normal_customer_value": 5.41,
-      "percentile_among_normal_customers": 96.76,
-      "unusual": true
+      "feature": "highest daily use (kWh)",
+      "customer_value": 53.24,
+      "typical_normal_customer_value": 21.97,
+      "percentile_among_normal_customers": 88.76
     },
     {
-      "feature": "average daily use (kWh)",
-      "customer_value": 19.66,
-      "typical_normal_customer_value": 5.48,
-      "percentile_among_normal_customers": 94.12,
-      "unusual": true
+      "feature": "similarity of each day to the day before (correlation)",
+      "customer_value": 0.96,
+      "typical_normal_customer_value": 0.77,
+      "percentile_among_normal_customers": 95.68
     },
     {
-      "feature": "change from first half to second half of the period (%)",
-      "customer_value": 47.24,
-      "typical_normal_customer_value": 7.02,
-      "percentile_among_normal_customers": 78.04,
-      "unusual": false
+      "feature": "use in Oct 2014 compared with own average (%)",
+      "customer_value": 44.71,
+      "typical_normal_customer_value": 79.03,
+      "percentile_among_normal_customers": 23.09
     },
     {
-      "feature": "days with zero or near-zero use",
-      "customer_value": 74,
-      "typical_normal_customer_value": 7.0,
-      "percentile_among_normal_customers": 70.77,
-      "unusual": false
+      "feature": "use in Oct 2016 compared with own average (%)",
+      "customer_value": 168.59,
+      "typical_normal_customer_value": 85.42,
+      "percentile_among_normal_customers": 90.58
+    }
+  ],
+  "features_that_pushed_toward_normal": [
+    {
+      "feature": "use in Apr 2014 compared with own average (%)",
+      "customer_value": 101.21,
+      "typical_normal_customer_value": 81.8,
+      "percentile_among_normal_customers": 74.15
     },
     {
-      "feature": "longest run of zero-use days",
-      "customer_value": 23,
-      "typical_normal_customer_value": 2.0,
-      "percentile_among_normal_customers": 68.7,
-      "unusual": false
+      "feature": "use in Jun 2016 compared with own average (%)",
+      "customer_value": 196.65,
+      "typical_normal_customer_value": 104.66,
+      "percentile_among_normal_customers": 90.53
     }
   ]
 }

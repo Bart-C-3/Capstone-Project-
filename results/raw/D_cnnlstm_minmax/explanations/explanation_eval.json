@@ -6,8 +6,12 @@
   "final_text_from_llm": 0,
   "final_text_from_template": 40,
   "all_final_texts_pass_guardrails": true,
-  "mean_flesch_reading_ease": 63.45233092028354,
-  "deletion_test_mean_logodds_drop_top_periods": 1.8967103227408983,
-  "deletion_test_mean_logodds_drop_random_periods": 0.167600733849868,
-  "deletion_test_top_beats_random_frac": 1.0
+  "mean_flesch_reading_ease": 61.17733705129437,
+  "deletion_test_mean_logodds_drop_top_periods": 1.3922676548211133,
+  "deletion_test_mean_logodds_drop_random_periods": 0.024515841549263718,
+  "deletion_test_top_beats_random_frac": 0.975,
+  "mode": "ensemble",
+  "feature_deletion_mean_logodds_drop_top3": 2.5619071040084846,
+  "feature_deletion_mean_logodds_drop_random3": 0.12558299265341916,
+  "feature_deletion_top_beats_random_frac": 1.0
 }

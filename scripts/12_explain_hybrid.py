@@ -1,12 +1,16 @@
 """
 Hybrid pipeline, Steps 3-6: evidence extractor + LLM narrator + guardrails
 =========================================================================
-The LSTM (from 11_train_lstm_detector_v2.py) has already made every decision.
-This script never changes a decision or a probability. For each customer the
-LSTM flagged, it:
+The detector has already made every decision. It is either the LSTM alone
+(11_train_lstm_detector_v2.py) or, if 14_gbm_ensemble.py has been run for that
+LSTM run, the ensemble (average of the LSTM and LightGBM). This script never
+changes a decision or a probability. For each flagged customer it:
 
   3. Builds an EVIDENCE JSON:
-       * decision + probability, copied from the LSTM
+       * decision + probability, copied from the detector
+       * ensemble mode: the features that pushed LightGBM toward "theft" most
+         (LightGBM's own per-feature contributions, i.e. SHAP values), with the
+         customer's value next to the typical normal customer's value
        * "suspicious periods": 4-week windows found by occlusion. Each window is
          replaced by that customer's own typical level and the LSTM is re-run;
          the bigger the drop in theft probability, the more that window drove
@@ -23,6 +27,9 @@ LSTM flagged, it:
   6. Explanation checks (written to explanation_eval.json):
        * deletion test: does hiding the top periods lower the theft probability
          more than hiding random periods? (are the periods really what the LSTM used)
+       * ensemble mode, feature deletion test: does setting the top features to
+         typical normal values lower LightGBM's theft score more than doing the
+         same to random features?
        * guardrail pass rate of the LLM, and readability (Flesch reading ease)
 
 Inputs : the run folder of 11_ (default data/lstm-hybrid-v2/raw/cnnlstm_minmax_col)
@@ -36,6 +43,7 @@ Usage
     python 12_explain_hybrid.py --no-llm            template writer only (fast, no download)
     python 12_explain_hybrid.py --customer-id <CONS_NO>
     python 12_explain_hybrid.py --top-n 50 --no-push
+    python 12_explain_hybrid.py --mode lstm         ignore the ensemble, explain the LSTM alone
 """
 
 import argparse
@@ -157,12 +165,69 @@ def occlusion_periods(scorer, x, m, base_prob, dates, window=WINDOW_DAYS):
         seg = x[s:s + window]
         periods.append({
             "start_date": str(dates[s].date()), "end_date": str(dates[s + window - 1].date()),
-            "theft_probability_if_period_looked_normal": float(occ[k]),
+            "lstm_theft_probability_if_period_looked_normal": float(occ[k]),
             "average daily use in this period (kWh)": float(seg.mean()),
             OVERALL_KEY: float(x.mean()),
             "missing readings in this period (days)": int(m[s:s + window].sum()),
         })
     return periods, starts, drops
+
+
+class FeatureModel:
+    """LightGBM half of the ensemble (from 14_gbm_ensemble.py) + normal-customer baseline."""
+
+    def __init__(self, ens_dir, X, M, y, cols, train_idx):
+        import lightgbm as lgb
+        spec = importlib.util.spec_from_file_location("gbm14", SCRIPT_DIR / "14_gbm_ensemble.py")
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+        self.cfg = json.loads((ens_dir / "ensemble_config.json").read_text(encoding="utf-8"))
+        self.booster = lgb.Booster(model_file=str(ens_dir / "gbm_model.txt"))
+        self.names = self.cfg["feature_names"]
+        self.dates = pd.to_datetime(cols)
+        normals = [i for i in train_idx if y[i] == 0]
+        self.base = self.mod.feature_table(X[normals], M[normals], cols)[self.names]
+        self.medians = self.base.median()
+
+    def frame(self, feats_list):
+        return self.mod.lgb_frame(pd.DataFrame(feats_list)[self.names])
+
+    def score(self, x, m):
+        feats = self.mod.customer_features(x, m, self.dates)
+        G = self.frame([feats])
+        it = self.cfg.get("best_iteration") or None
+        prob = float(self.booster.predict(G, num_iteration=it)[0])
+        contrib = self.booster.predict(G, num_iteration=it, pred_contrib=True)[0][:-1]   # last = bias
+        return prob, feats, contrib
+
+    def predict_feats(self, feats_list):
+        it = self.cfg.get("best_iteration") or None
+        return self.booster.predict(self.frame(feats_list), num_iteration=it)
+
+    def evidence(self, feats, contrib, n_theft=4, n_normal=2):
+        order = np.argsort(-contrib)
+        def item(k):
+            name = self.names[k]
+            return {"feature": name, "customer_value": feats[name],
+                    "typical_normal_customer_value": float(self.medians[name]),
+                    "percentile_among_normal_customers": percentile_vs_normal(feats[name], self.base[name].to_numpy())}
+        toward_theft = [item(k) for k in order[:n_theft] if contrib[k] > 0]
+        toward_normal = [item(k) for k in order[::-1][:n_normal] if contrib[k] < 0]
+        return toward_theft, toward_normal, order
+
+
+def feature_deletion_test(fm, feats, order, rng, k=3):
+    """Set the top-k theft features to typical normal values vs k random features (log-odds drop)."""
+    logit = lambda q: float(np.log(np.clip(q, 1e-6, 1 - 1e-6) / (1 - np.clip(q, 1e-6, 1 - 1e-6))))
+    def drop(keys):
+        f2 = dict(feats)
+        for kk in keys:
+            f2[fm.names[kk]] = float(fm.medians[fm.names[kk]])
+        return f2
+    top = list(order[:k])
+    rand = list(rng.choice(len(fm.names), size=k, replace=False))
+    p0, pt, pr = fm.predict_feats([feats, drop(top), drop(rand)])
+    return logit(p0) - logit(pt), logit(p0) - logit(pr)
 
 
 def percentile_vs_normal(value, col):
@@ -180,7 +245,8 @@ def r(v, nd=2):
     return v
 
 
-def build_evidence(cid, prob, threshold, feats, base, periods):
+def build_evidence(cid, prob, threshold, feats, base, periods, ensemble=None):
+    """ensemble: None (LSTM only) or dict with lstm/gbm probabilities and feature evidence."""
     comparisons = []
     for name, val in feats.items():
         pct = percentile_vs_normal(val, base[name].to_numpy())
@@ -198,8 +264,16 @@ def build_evidence(cid, prob, threshold, feats, base, periods):
         "theft_probability": prob,
         "decision_threshold": threshold,
         "suspicious_periods": periods,
-        "comparison_with_normal_customers": comparisons[:5],
     }
+    if ensemble is None:
+        ev["comparison_with_normal_customers"] = comparisons[:5]
+    else:
+        ev["decided_by"] = ("average of an LSTM model (reads the daily usage curve) and a LightGBM model "
+                            "(reads summary features); the language model does not change this")
+        ev["lstm_theft_probability"] = ensemble["lstm_probability"]
+        ev["feature_model_theft_probability"] = ensemble["gbm_probability"]
+        ev["features_that_pushed_toward_theft"] = ensemble["toward_theft"]
+        ev["features_that_pushed_toward_normal"] = ensemble["toward_normal"]
     return r(ev)
 
 
@@ -247,9 +321,9 @@ def check_text(text, evidence):
     low = text.lower()
     flagged = evidence["decision"].startswith("flagged")
     if flagged and re.search(r"\b(not (a )?(theft|suspicious|flagged)|no (evidence of )?theft|is normal)\b", low):
-        problems.append("text contradicts the LSTM decision")
+        problems.append("text contradicts the detector's decision")
     if not flagged and re.search(r"\b(is|was) (committing|stealing)\b", low):
-        problems.append("text contradicts the LSTM decision")
+        problems.append("text contradicts the detector's decision")
     if len(text.split()) < 25:
         problems.append("too short")
     return problems
@@ -260,7 +334,8 @@ def check_text(text, evidence):
 # ─────────────────────────────────────────────
 def template_writer(ev):
     pct = round(ev["theft_probability"] * 100)
-    lines = [f"Customer {ev['customer_id']} was {ev['decision']} by the LSTM detector, "
+    who = "the detector (an LSTM and a feature model combined)" if "lstm_theft_probability" in ev else "the LSTM detector"
+    lines = [f"Customer {ev['customer_id']} was {ev['decision']} by {who}, "
              f"with an estimated theft probability of {pct}%."]
     if ev["suspicious_periods"]:
         p = ev["suspicious_periods"][0]
@@ -268,7 +343,11 @@ def template_writer(ev):
             f"The period that most influenced this decision was {p['start_date']} to {p['end_date']}, "
             f"when average use was {p['average daily use in this period (kWh)']} kWh per day compared with "
             f"this customer's usual {p[OVERALL_KEY]} kWh.")
-    unusual = [c for c in ev["comparison_with_normal_customers"] if c["unusual"]][:3]
+    if "features_that_pushed_toward_theft" in ev:
+        for c in ev["features_that_pushed_toward_theft"][:3]:
+            lines.append(f"A warning sign is \"{c['feature']}\": {c['customer_value']} for this customer, "
+                         f"against {c['typical_normal_customer_value']} for a typical normal customer.")
+    unusual = [c for c in ev.get("comparison_with_normal_customers", []) if c["unusual"]][:3]
     for c in unusual:
         direction = "higher" if c["percentile_among_normal_customers"] >= 50 else "lower"
         lines.append(f"For \"{c['feature']}\" this customer has {c['customer_value']}, {direction} than most "
@@ -289,7 +368,7 @@ class LLMWriter:
     def __call__(self, ev, strict=False):
         rules = ("Use ONLY facts and numbers from the JSON. Do not invent numbers. Do not change the "
                  "decision. Write 3-5 short sentences for a utility inspector with no technical background. "
-                 "Mention the most suspicious period and the most unusual comparison. End by saying an "
+                 "Mention the most suspicious period and the strongest warning signs. End by saying an "
                  "inspection is needed to confirm.")
         if strict:
             rules += " Copy numbers exactly as written in the JSON. Do not do any arithmetic."
@@ -371,6 +450,8 @@ def main():
     ap.add_argument("--customer-id", default=None)
     ap.add_argument("--no-llm", action="store_true", help="use the template writer only")
     ap.add_argument("--llm-id", default=LLM_ID)
+    ap.add_argument("--mode", choices=["auto", "ensemble", "lstm"], default="auto",
+                    help="auto: use the ensemble if 14_gbm_ensemble.py was run for this LSTM run")
     ap.add_argument("--no-push", action="store_true")
     args = ap.parse_args()
 
@@ -395,13 +476,26 @@ def main():
     scorer = Scorer(v2, run_dir, device)
     base = normal_baseline(X, M, y, train_idx)
 
-    preds = pd.read_csv(run_dir / "test_predictions.csv", dtype={"CONS_NO": str})
+    ens_dir = run_dir / "ensemble"
+    use_ens = args.mode == "ensemble" or (args.mode == "auto" and (ens_dir / "ensemble_config.json").exists())
+    fm = None
+    if use_ens:
+        if not (ens_dir / "ensemble_config.json").exists():
+            raise SystemExit(f"[ERROR] no ensemble in {ens_dir}; run 14_gbm_ensemble.py first or use --mode lstm.")
+        print("Mode: ensemble (LSTM + LightGBM)")
+        fm = FeatureModel(ens_dir, X, M, y, cols, train_idx)
+        threshold, w = float(fm.cfg["threshold"]), float(fm.cfg["lstm_weight"])
+        preds = pd.read_csv(ens_dir / "test_predictions.csv", dtype={"CONS_NO": str})
+    else:
+        print("Mode: LSTM only")
+        threshold, w = scorer.threshold, 1.0
+        preds = pd.read_csv(run_dir / "test_predictions.csv", dtype={"CONS_NO": str})
     if args.customer_id:
         chosen = [args.customer_id]
     else:
-        flagged = preds[preds.theft_probability >= scorer.threshold]
+        flagged = preds[preds.theft_probability >= threshold]
         chosen = flagged.sort_values("theft_probability", ascending=False).CONS_NO.head(args.top_n).tolist()
-    print(f"Explaining {len(chosen)} customer(s); threshold {scorer.threshold:.3f}")
+    print(f"Explaining {len(chosen)} customer(s); threshold {threshold:.3f}")
 
     llm = None
     if not args.no_llm:
@@ -412,20 +506,33 @@ def main():
 
     out_dir = run_dir / "explanations"
     (out_dir / "evidence").mkdir(parents=True, exist_ok=True)
+    for old in (out_dir / "evidence").glob("*.json"):   # start clean so files match this run
+        old.unlink()
     rng = np.random.RandomState(SEED)
-    records, del_top, del_rand = [], [], []
+    records, del_top, del_rand, fdel_top, fdel_rand = [], [], [], [], []
     for cid in chosen:
         if cid not in pos:
             print(f"  {cid}: not in the data file, skipped")
             continue
         i = pos[cid]
         x, m = X[i].astype(np.float32), M[i].astype(np.float32)
-        prob = float(scorer(x[None], m[None])[0])
-        periods, starts, drops = occlusion_periods(scorer, x, m, prob, dates)
-        ev = build_evidence(cid, prob, scorer.threshold, readable_features(x, m), base, periods)
+        p_lstm = float(scorer(x[None], m[None])[0])
+        periods, starts, drops = occlusion_periods(scorer, x, m, p_lstm, dates)
+        ens = None
+        prob = p_lstm
+        if fm is not None:
+            p_gbm, feats, contrib = fm.score(x, m)
+            toward_theft, toward_normal, order = fm.evidence(feats, contrib)
+            prob = w * p_lstm + (1 - w) * p_gbm
+            ens = {"lstm_probability": p_lstm, "gbm_probability": p_gbm,
+                   "toward_theft": toward_theft, "toward_normal": toward_normal}
+            ft, fr = feature_deletion_test(fm, feats, order, rng)
+            fdel_top.append(ft)
+            fdel_rand.append(fr)
+        ev = build_evidence(cid, prob, threshold, readable_features(x, m), base, periods, ens)
         (out_dir / "evidence" / f"{cid}.json").write_text(json.dumps(ev, indent=2), encoding="utf-8")
         text, writer, attempts = narrate(ev, llm)
-        dt, dr = deletion_test(scorer, x, m, prob, starts, drops, rng)
+        dt, dr = deletion_test(scorer, x, m, p_lstm, starts, drops, rng)
         del_top.append(dt)
         del_rand.append(dr)
         records.append({"CONS_NO": cid, "true_label": int(y[i]), "theft_probability": ev["theft_probability"],
@@ -440,7 +547,7 @@ def main():
         for rec in records:
             f.write(json.dumps(rec) + "\n")
     with open(out_dir / "explanations.md", "w", encoding="utf-8") as f:
-        f.write("# LSTM theft flags, explained\n\n")
+        f.write(f"# Theft flags, explained ({'LSTM + LightGBM ensemble' if fm else 'LSTM'})\n\n")
         for rec in records:
             f.write(f"## {rec['CONS_NO']}  (p = {rec['theft_probability']}, true label {rec['true_label']}, "
                     f"written by {rec['writer']})\n\n{rec['explanation']}\n\n")
@@ -459,7 +566,12 @@ def main():
         "deletion_test_mean_logodds_drop_top_periods": float(np.mean(del_top)),
         "deletion_test_mean_logodds_drop_random_periods": float(np.mean(del_rand)),
         "deletion_test_top_beats_random_frac": float(np.mean(np.array(del_top) > np.array(del_rand))),
+        "mode": "ensemble" if fm else "lstm",
     }
+    if fm is not None:
+        summary["feature_deletion_mean_logodds_drop_top3"] = float(np.mean(fdel_top))
+        summary["feature_deletion_mean_logodds_drop_random3"] = float(np.mean(fdel_rand))
+        summary["feature_deletion_top_beats_random_frac"] = float(np.mean(np.array(fdel_top) > np.array(fdel_rand)))
     (out_dir / "explanation_eval.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print("\n" + json.dumps(summary, indent=2))
     print(f"\nSaved to {out_dir}")

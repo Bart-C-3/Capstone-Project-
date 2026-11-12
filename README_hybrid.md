@@ -7,7 +7,7 @@ New scripts (put them in the project folder next to `repo_sync.py`, `imputed_dat
 | `11_train_lstm_detector_v2.py` | 1–2 | Trains the LSTM detector, saves model, config, splits, predictions. `--ablation` runs the comparison table. |
 | `12_explain_hybrid.py` | 3–6 | For each flagged customer: evidence JSON (occlusion periods + comparison with normal customers) → TinyLlama writes the text → guardrails check every number/date → template fallback. Writes `explanation_eval.json`. |
 | `13_run_hybrid_pipeline.py` | 7 | Runs 11 then 12 with one command. |
-| `14_gbm_ensemble.py` | 1 | LightGBM on engineered features, averaged with an LSTM run (fair 50/50 split). |
+| `14_gbm_ensemble.py` | 1 | LightGBM on readable features, averaged with an LSTM run. **This ensemble is the decision-maker**; its model goes to `<lstm run>/ensemble/`. |
 
 All three keep the project rules: `--no-push` flag, `repo_sync.push_run(...)` at the end, weights never pushed, Windows-safe data loaders (`num_workers=0`, `pin_memory=False`).
 
@@ -18,7 +18,7 @@ py 13_run_hybrid_pipeline.py                 # train (GPU) + explain top 20 flag
 py 11_train_lstm_detector_v2.py --ablation   # full comparison table, incl. the paper model
 py 12_explain_hybrid.py --no-llm             # explanations without downloading TinyLlama
 ```
-`12_` needs `transformers` for TinyLlama (`py -m pip install transformers accelerate`). Without it, or offline, it falls back to the template writer and says so.
+`12_` needs `transformers` for TinyLlama and `14_` needs `lightgbm` (`py -m pip install transformers accelerate lightgbm`). `13_` runs 11 → 14 → 12; use `--no-ensemble` to explain the LSTM alone. Without it, or offline, it falls back to the template writer and says so.
 
 ## Why v1 collapsed (verified on the real SGCC data)
 
@@ -89,3 +89,25 @@ How to read this:
 - On the first try, the paper protocol with the paper's exact Min-Max values trained unstably (val AUC jumping 0.5–0.7). Min-Max over all customers squashes ~99% of SGCC values to about -1, which breaks the BatchNorm statistics. The run above keeps the paper's fill → oversample → split order and oversamples in Min-Max space, but maps the rows back to kWh and uses log scaling for the model. Set `PAPER_KEEP_MINMAX = True` to repeat the unstable version.
 
 Recommended for the report: give the paper-protocol number to show you reproduced the paper, and the fair numbers as the real performance.
+
+## Ensemble as the decision-maker (`14_` + `12_ --mode ensemble`)
+
+The hybrid system's decision is now the average of the CNN-LSTM and a LightGBM model on readable features (zero-use streaks, monthly profile, recent use vs own average, ...). The threshold is tuned on validation only. Fair 50/50 test, 1,446 real customers:
+
+| Detector | Val AUC | Test acc | Test F1 | Test AUC | Test MCC |
+|---|---|---|---|---|---|
+| LightGBM alone | 0.796 | 0.687 | 0.724 | 0.784 | 0.388 |
+| CNN-LSTM alone | 0.818 | 0.735 | 0.729 | 0.822 | 0.471 |
+| **Ensemble (decision-maker)** | 0.844 | 0.741 | **0.763** | **0.840** | 0.490 |
+
+The evidence JSON now contains, for each flagged customer:
+- both models' probabilities and the combined one;
+- the LSTM's most influential 4-week periods (occlusion, as before);
+- the features that pushed LightGBM toward "theft" and toward "normal". These come from LightGBM's per-feature contributions (SHAP values computed by LightGBM itself), with the customer's value next to a typical normal customer's.
+
+Faithfulness checks (40 most confident flags, template writer):
+- All final texts pass the guardrails.
+- Periods: hiding the top 3 lowers the LSTM's theft log-odds by 1.39 vs 0.02 for random periods (top wins in 39/40).
+- Features: resetting the top 3 to typical normal values lowers LightGBM's log-odds by 2.56 vs 0.13 for 3 random features (top wins in 40/40).
+
+Note for the report: many of the most confident flags are very large consumers (e.g. 156 kWh/day against 5.5 for a typical normal customer), and "high usage" is often the top feature. That is what the model learned from SGCC's labels, and the explanation shows it faithfully. It is worth discussing as a possible bias in the dataset, rather than hiding it.
