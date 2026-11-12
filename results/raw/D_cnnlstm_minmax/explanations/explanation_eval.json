@@ -1,0 +1,13 @@
+{
+  "customers_explained": 40,
+  "precision_of_explained_flags": 1.0,
+  "llm_used": false,
+  "llm_first_try_pass_rate": null,
+  "final_text_from_llm": 0,
+  "final_text_from_template": 40,
+  "all_final_texts_pass_guardrails": true,
+  "mean_flesch_reading_ease": 63.45233092028354,
+  "deletion_test_mean_logodds_drop_top_periods": 1.8967103227408983,
+  "deletion_test_mean_logodds_drop_random_periods": 0.167600733849868,
+  "deletion_test_top_beats_random_frac": 1.0
+}
