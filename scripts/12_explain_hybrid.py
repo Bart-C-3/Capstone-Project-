@@ -368,6 +368,19 @@ class LLMWriter:
             model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype)
         self.model = model.to(device).eval()
         self.device = device
+        # Set the generation options on the model itself. Newer transformers merge
+        # any passed settings with the model's stored defaults, so TinyLlama's own
+        # max_length (2048) and sampling options must be cleared here; otherwise
+        # every call prints "Both max_new_tokens and max_length seem to have been set".
+        gc = self.model.generation_config
+        gc.max_length = None
+        gc.max_new_tokens = 220
+        gc.do_sample = False
+        gc.temperature = None
+        gc.top_p = None
+        gc.top_k = None
+        gc.repetition_penalty = 1.1
+        gc.pad_token_id = self.tok.eos_token_id
 
     def __call__(self, ev, strict=False):
         rules = ("Use ONLY facts and numbers from the JSON. Do not invent numbers. Do not change the "
@@ -384,8 +397,7 @@ class LLMWriter:
                                            return_dict=True)
         enc = {k: v.to(self.device) for k, v in enc.items()}
         with torch.no_grad():
-            out = self.model.generate(**enc, max_new_tokens=220, do_sample=False, repetition_penalty=1.1,
-                                      pad_token_id=self.tok.eos_token_id)
+            out = self.model.generate(**enc)
         n_prompt = enc["input_ids"].shape[1]
         return self.tok.decode(out[0, n_prompt:], skip_special_tokens=True).strip()
 
