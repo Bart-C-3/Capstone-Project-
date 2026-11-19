@@ -163,3 +163,37 @@ Changes:
   - "kWh in a row" and "went N kWh" are banned.
 
 Re-checking the 9 texts that passed v2: **all 9 are now rejected**, each for at least one of the errors above. A correct plain-English text still passes, and the template passes for all 40 test customers (readability 78).
+
+### Narrator v2.2: TinyLlama vs Qwen2.5-1.5B, label checks
+
+Two runs with narrator v2.1 on the same 20 customers:
+
+| | TinyLlama-1.1B | Qwen2.5-1.5B-Instruct |
+|---|---|---|
+| Text written by LLM / template (v2.1 checks) | 19 / 1 | 12 / 8 |
+| Readability (Flesch) | ~84 | ~65 |
+| Kept texts with a value under the wrong label | 14 of 19 | 1 of 12 |
+| Main reason for rejection | – | period written as "December 2nd to December 29th" (no year) |
+
+TinyLlama wrote fluent text but often put a correct number under the wrong label. For example, "In the last 90 days they used 156.13 kWh" used the overall average, not the last-90-days value. It also credited the customer's own usual use to "a typical honest customer". Qwen almost always used the right value for each label.
+
+Changes (v2.2):
+- **Label check:**
+  - phrases such as "last 90 days", "highest daily use", "missing readings" or "October 2014 … %" must be followed by that feature's value from the evidence;
+  - a number credited to "a typical honest customer" must be a typical value.
+- **Intensifiers:** "significantly / far / much" are rejected when the two numbers differ by less than 25%.
+- **Comparison check** also covers "exceeding", "above" and "below".
+- **Written-out dates** ("January 1 to January 28, 2014") are accepted when the year is included.
+- **Number check fix:** "29," is no longer misread.
+- **Targeted retry:** the second try tells the model exactly why its first answer was rejected, and the prompt asks for dates in YYYY-MM-DD form.
+
+Re-scoring the first tries on the 12 customers whose full evidence could be rebuilt from template texts:
+
+| First try passes | old checks | v2.2 checks |
+|---|---|---|
+| TinyLlama | 10 of 12 | 2 of 12 |
+| Qwen | 4 of 12 | 5 of 12 |
+
+Correct texts still pass: the template and a correctly written LLM-style text pass for all 40 test customers.
+
+**Recommended narrator: Qwen2.5-1.5B-Instruct** (`--llm-id Qwen/Qwen2.5-1.5B-Instruct`).

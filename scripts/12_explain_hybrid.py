@@ -376,7 +376,7 @@ def evidence_facts(ev):
 # ─────────────────────────────────────────────
 # Step 5: guardrails
 # ─────────────────────────────────────────────
-NUM_RE = re.compile(r"(?<![\w.])-?\d[\d,]*(?:\.\d+)?(?![\w])")
+NUM_RE = re.compile(r"(?<![\w.])-?\d+(?:,\d{3})*(?:\.\d+)?(?![\w])")
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 # Phrases from the first TinyLlama run that were invented or described the file.
 BANNED = [
@@ -390,8 +390,14 @@ BANNED = [
     (r"\bthreshold\b", "uses a technical term (threshold)"),
     (r"\blstm\b|\blightgbm\b|\bshap\b|\blog-odds\b|\bcorrelation\b|\bcoefficient\b", "uses a technical term"),
     (r"kwh in a row|\bwent \d[\d.,]* kwh|kwh[^.]{0,30}without using", "describes kWh as a run of days"),
+    (r"\bused [\d.,]+ days\b|\blast (?!90 days)[\d.,]+ days\b", "mixes up days and usage"),
 ]
-COMPARE_RE = re.compile(r"\b(more|higher|greater|larger|bigger|less|lower|smaller|fewer)\s+than\b")
+COMPARE_RE = re.compile(r"\b(?:(more|higher|greater|larger|bigger|less|lower|smaller|fewer)\s+than"
+                        r"|(exceed\w*|above|below))\b")
+STRONG_RE = re.compile(r"\b(significantly|far|much|substantially|considerably|greatly|well|dramatically)\b")
+MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september",
+          "october", "november", "december"]
+NAT_DATE_RE = re.compile(r"\b(" + "|".join(MONTHS) + r")\s+(\d{1,2})(?:st|nd|rd|th)?\b(?:,?\s+(\d{4}))?")
 MULT_RE = re.compile(r"^\s*(twice|double|(\w+|\d+(?:\.\d+)?) times)\b")
 WORD_NUM = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
             "ten": 10, "twenty": 20, "fifty": 50, "hundred": 100}
@@ -481,6 +487,7 @@ def comparison_problems(text, ev):
     for sent in _sentences(text):
         low = sent.lower()
         for m in COMPARE_RE.finditer(low):
+            word = m.group(1) or m.group(2)
             before, after = low[:m.start()], low[m.end():]
             xs = _nums(before)
             if not xs:
@@ -503,13 +510,15 @@ def comparison_problems(text, ev):
                 y = usual
             else:
                 continue
-            up = m.group(1) in ("more", "higher", "greater", "larger", "bigger")
+            up = word in ("more", "higher", "greater", "larger", "bigger", "above") or word.startswith("exceed")
             if up and not x > factor * y:
                 probs.append(f"says {x} is {'%g times ' % factor if factor > 1 else ''}more than {y}")
             if not up and not x < y:
                 probs.append(f"says {x} is less than {y}")
             if "slightly" in before[-25:] and y and not (0.7 <= x / y <= 1.4):
                 probs.append(f"calls the gap between {x} and {y} slight")
+            if STRONG_RE.search(before[-25:]) and y and 0.8 < x / y < 1.25:
+                probs.append(f"calls the gap between {x} and {y} large, but it is small")
     # "their usual/typical ... N" must be this customer's own value
     for sent in _sentences(text):
         # look only at the few words right after "their usual", up to a comma
@@ -520,6 +529,97 @@ def comparison_problems(text, ev):
     return probs
 
 
+LABELS = [  # (phrase in the text, evidence feature whose value must follow it)
+    (r"\b(last|past) 90 days\b", ["average daily use in the last 90 days (kWh)",
+                                   "use in the last 90 days compared with own average (%)"]),
+    (r"\bhighest (daily |single[- ]day )?(use|usage|day)\b", ["highest daily use (kWh)"]),
+    (r"\bmissing (meter )?readings?\b", ["missing meter readings (days)"]),
+    (r"\bzero[- ]use days|days? (with|of) (no|almost no|zero) use\b", ["longest run of zero-use days",
+                                                                       "share of days with zero or near-zero use (%)"]),
+]
+
+
+def _theft_features(ev):
+    items = ev.get("features_that_pushed_toward_theft") or ev.get("comparison_with_normal_customers") or []
+    return {c["feature"]: (float(c["customer_value"]), float(c["typical_normal_customer_value"])) for c in items}
+
+
+def label_problems(text, ev):
+    """A labelled number must be the evidence value for that label."""
+    feats = _theft_features(ev)
+    _, typ_all = value_roles(ev)
+    probs = []
+    for sent in _sentences(text):
+        low = sent.lower()
+        for pattern, names in LABELS:
+            m = re.search(pattern, low)
+            if not m:
+                continue
+            ns = _nums(low[m.end():])
+            if not ns:
+                continue
+            present = [feats[n][0] for n in names if n in feats]
+            if not present:
+                probs.append(f"gives a value for '{m.group(0)}', which is not in the evidence")
+            elif not _close(ns[0], present):
+                probs.append(f"gives {ns[0]} for '{m.group(0)}', but the evidence says {present[0]}")
+        # months: "October 2014 ... 25.52%" must be that month's value
+        for mm in re.finditer(r"\b(" + "|".join(MONTHS) + r")\s+(20\d\d)\b", low):
+            ns = [n for n in _nums(low[mm.end():])]
+            name = f"use in {mm.group(1)[:3].title()} {mm.group(2)} compared with own average (%)"
+            if "%" in low[mm.end():] and ns:
+                if name not in feats:
+                    probs.append(f"gives a value for {mm.group(1)} {mm.group(2)}, which is not in the evidence")
+                elif not _close(ns[0], [feats[name][0]]):
+                    probs.append(f"gives {ns[0]}% for {mm.group(1)} {mm.group(2)}, but the evidence says {feats[name][0]}")
+        # a number credited to "a typical honest customer" must be the typical value
+        for pat in (r"(\d[\d,]*(?:\.\d+)?)\s*(?:kwh|%|days)?\s+(?:of|for)\s+(?:a|an)\s+(?:typical\s+)?honest customer",
+                    r"honest customer(?:'s|s')?\s+(?:\w+\s+){0,3}?(?:of\s+)?(\d[\d,]*(?:\.\d+)?)",
+                    r"honest customer,?\s+who has\s+(\d[\d,]*(?:\.\d+)?)"):
+            for m in re.finditer(pat, low):
+                v = float(m.group(1).replace(",", ""))
+                if not _close(v, typ_all):
+                    probs.append(f"credits {v} to a typical honest customer, but it is not a typical value")
+    return probs
+
+
+def mentions_period(text, ev):
+    """The main period counts if given as ISO dates, or written out with the year."""
+    periods = ev.get("suspicious_periods") or []
+    if not periods:
+        return True
+    start, end = periods[0]["start_date"], periods[0]["end_date"]
+    if start in text:
+        return True
+    want = []
+    for d in (start, end):
+        y, mo, da = d.split("-")
+        want.append((MONTHS[int(mo) - 1], int(da), y))
+    for sent in _sentences(text):
+        low = sent.lower()
+        found = [(m.group(1), int(m.group(2))) for m in NAT_DATE_RE.finditer(low)]
+        if all((mo, da) in found for mo, da, _ in want) and want[0][2] in low:
+            return True
+    return False
+
+
+def _strip_period_dates(text, ev):
+    """Remove written-out period dates so their day numbers are not counted as stray numbers."""
+    periods = ev.get("suspicious_periods") or []
+    if not periods:
+        return text
+    ok = set()
+    for d in (periods[0]["start_date"], periods[0]["end_date"]):
+        y, mo, da = d.split("-")
+        ok.add((MONTHS[int(mo) - 1], int(da), y))
+    def sub(m):
+        key = (m.group(1).lower(), int(m.group(2)))
+        if any(key == (a, b) and (m.group(3) in (None, c)) for a, b, c in ok):
+            return m.group(1)
+        return m.group(0)
+    return re.sub(NAT_DATE_RE.pattern, sub, text, flags=re.I)
+
+
 def check_text(text, evidence):
     """Return a list of problems (empty list = passes)."""
     problems = []
@@ -528,7 +628,7 @@ def check_text(text, evidence):
     for date in DATE_RE.findall(text):
         if date not in ev_json:
             problems.append(f"date not in evidence: {date}")
-    for tok in NUM_RE.findall(DATE_RE.sub(" ", text)):
+    for tok in NUM_RE.findall(DATE_RE.sub(" ", _strip_period_dates(text, evidence))):
         v = float(tok.replace(",", ""))
         if not any(abs(v - a) <= max(0.011, 0.005 * abs(a)) for a in allowed):
             problems.append(f"number not in evidence: {tok}")
@@ -544,10 +644,11 @@ def check_text(text, evidence):
         problems.append("text contradicts the detector's decision")
     problems += direction_problems(text, evidence)
     problems += comparison_problems(text, evidence)
+    problems += label_problems(text, evidence)
     # Must carry the key evidence, not just generic words.
     periods = evidence.get("suspicious_periods") or []
-    if periods and periods[0]["start_date"] not in text:
-        problems.append("does not mention the most suspicious period")
+    if periods and not mentions_period(text, evidence):
+        problems.append("does not mention the most suspicious period (with its year)")
     signs = warning_signs(evidence)
     if signs and not any(re.search(rf"(?<![\d.]){re.escape(str(c))}(?![\d])", text) for _, c, _, _ in signs):
         problems.append("does not mention any warning sign value")
@@ -592,7 +693,8 @@ EXAMPLE_ANSWER = (
 SYSTEM_PROMPT = (
     "You write short notes for electricity inspectors who are not technical. "
     "Rewrite the facts you are given as one short paragraph of 4 to 6 plain sentences. "
-    "Rules: use only the facts given; copy every number and date exactly; copy the words "
+    "Rules: use only the facts given; copy every number exactly; write dates exactly as in the facts "
+    "(for example 2015-03-04), never as words; copy the words "
     "'more', 'less', 'higher' and 'lower' from the facts and never change them; do not add any other "
     "information; do not calculate anything; do not explain how the detector works; do not use technical words; keep each "
     "sentence under 25 words; end by saying someone should check the meter on site."
@@ -625,10 +727,11 @@ class LLMWriter:
         gc.repetition_penalty = 1.05
         gc.pad_token_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.tok.eos_token_id
 
-    def __call__(self, ev, strict=False):
+    def __call__(self, ev, feedback=None):
         system = SYSTEM_PROMPT
-        if strict:
-            system += " Your last answer broke these rules. Keep it simpler and closer to the facts."
+        if feedback:   # second try: say exactly what was wrong with the first one
+            system += (" Your last answer was rejected for these reasons: " + "; ".join(feedback[:5]) +
+                       ". Fix them. Stay closer to the wording of the facts.")
         facts = "\n".join(f"- {f}" for f in evidence_facts(ev))
         example = "\n".join(f"- {f}" for f in EXAMPLE_FACTS)
         msgs = [{"role": "system", "content": system},
@@ -659,13 +762,15 @@ def narrate(ev, llm):
     """LLM first (2 tries), template if the guardrails reject both."""
     attempts = []
     if llm is not None:
-        for strict in (False, True):
-            raw = llm(ev, strict=strict)
+        feedback = None
+        for _ in range(2):
+            raw = llm(ev, feedback=feedback)
             text = trim_to_sentence(raw)
             problems = check_text(text, ev)
             attempts.append({"text": text, "raw": raw, "problems": problems})
             if not problems:
                 return text, "llm", attempts
+            feedback = problems
     text = template_writer(ev)
     problems = check_text(text, ev)
     if problems:   # should never happen; fail loudly so it gets fixed
