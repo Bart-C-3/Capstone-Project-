@@ -17,11 +17,17 @@ changes a decision or a probability. For each flagged customer it:
          the decision.
        * how the customer's usage compares with NORMAL customers from the
          training split (percentile ranks of simple, readable features).
-  4. Asks a small LLM (TinyLlama-1.1B-Chat) to write a plain-English summary
-     from the evidence JSON ONLY.
+  4. Turns the evidence into short plain fact sentences and asks a small LLM
+     (TinyLlama-1.1B-Chat by default) to rewrite them as one plain paragraph,
+     with one worked example in the prompt. The LLM never sees anything else.
   5. Guardrails on the text:
-       * every number in the text must appear in the evidence JSON
-       * the text must not contradict the decision (e.g. call a flagged customer "normal")
+       * every number and date in the text must appear in the evidence
+       * no contradiction of the decision, no wrong "higher/lower" claims
+       * no invented content seen in earlier runs (talking about the JSON file,
+         the "language model", locations, training data, the future, jargon)
+       * must mention the main suspicious period, a warning-sign value and an
+         on-site check; must end with a full sentence (cut-off replies are
+         trimmed to their last full sentence first)
      If the LLM fails twice, a fixed template writes the summary instead, so the
      output is always faithful. Each result records which writer was used.
   6. Explanation checks (written to explanation_eval.json):
@@ -44,9 +50,11 @@ Usage
     python 12_explain_hybrid.py --customer-id <CONS_NO>
     python 12_explain_hybrid.py --top-n 50 --no-push
     python 12_explain_hybrid.py --mode lstm         ignore the ensemble, explain the LSTM alone
+    python 12_explain_hybrid.py --llm-id Qwen/Qwen2.5-1.5B-Instruct   stronger small model (fits 8 GB)
 """
 
 import argparse
+import collections
 import importlib.util
 import json
 import os
@@ -278,19 +286,113 @@ def build_evidence(cid, prob, threshold, feats, base, periods, ensemble=None):
 
 
 # ─────────────────────────────────────────────
+# Step 4a: evidence -> short plain facts
+# ─────────────────────────────────────────────
+# A 1.1B model cannot reliably read nested JSON (it starts describing the file),
+# so it gets short fact sentences instead. Every number in them comes from the evidence.
+MONTH_RE = re.compile(r"^use in (\w{3} \d{4}) compared with own average \(%\)$")
+DAY_RE = re.compile(r"^use on (\w+) compared with own average \(%\)$")
+SHORT_NAMES = {
+    "average daily use (kWh)": ("average daily use", "kWh"),
+    "highest daily use (kWh)": ("highest daily use", "kWh"),
+    "median daily use (kWh)": ("typical (median) daily use", "kWh"),
+    "day-to-day variability (coefficient of variation)": ("how much use jumps from day to day", ""),
+    "share of days with zero or near-zero use (%)": ("share of days with almost no use", "%"),
+    "longest run of zero-use days": ("longest run of days with no use", "days"),
+    "missing meter readings (days)": ("missing meter readings", "days"),
+    "largest one-day drop in use (kWh)": ("biggest drop in use from one day to the next", "kWh"),
+    "similarity of each day to the day before (correlation)": ("how similar each day is to the day before", ""),
+    "similarity of each day to the same day a week before (correlation)": ("how similar each day is to the same day a week before", ""),
+    "change in use per year (% of average)": ("yearly change in use, as a % of their average", "%"),
+    "average daily use in the last 90 days (kWh)": ("average daily use in the last 90 days", "kWh"),
+    "use in the last 90 days compared with own average (%)": ("use in the last 90 days, as a % of their usual use", "%"),
+}
+
+
+def short_name(feature):
+    if feature in SHORT_NAMES:
+        return SHORT_NAMES[feature]
+    m = MONTH_RE.match(feature)
+    if m:
+        return f"use in {m.group(1)}, as a % of their usual use", "%"
+    m = DAY_RE.match(feature)
+    if m:
+        return f"use on {m.group(1)}, as a % of their usual use", "%"
+    return feature, ""
+
+
+def fmt(value, unit):
+    if unit == "kWh":
+        return f"{value} kWh"
+    if unit == "%":
+        return f"{value}%"
+    if unit == "days":
+        return f"{value} days"
+    return f"{value}"
+
+
+def warning_signs(ev, k=3):
+    """(plain name, customer value, typical value, unit) for the top theft-side features."""
+    if "features_that_pushed_toward_theft" in ev:
+        items = ev["features_that_pushed_toward_theft"]
+    else:
+        items = [c for c in ev.get("comparison_with_normal_customers", []) if c.get("unusual")]
+    out = []
+    for c in items[:k]:
+        name, unit = short_name(c["feature"])
+        out.append((name, c["customer_value"], c["typical_normal_customer_value"], unit))
+    return out
+
+
+def evidence_facts(ev):
+    pct = round(ev["theft_probability"] * 100)
+    flagged = ev["decision"].startswith("flagged")
+    facts = [("The detector flagged this customer as a possible electricity thief." if flagged
+              else "The detector did not flag this customer."),
+             f"The detector is {pct}% sure."]
+    if ev.get("suspicious_periods"):
+        p = ev["suspicious_periods"][0]
+        facts.append(f"The most suspicious time was {p['start_date']} to {p['end_date']}.")
+        facts.append(f"In that time the customer used {p['average daily use in this period (kWh)']} kWh a day. "
+                     f"Their usual use is {p[OVERALL_KEY]} kWh a day.")
+    for name, cust, typ, unit in warning_signs(ev):
+        facts.append(f"Warning sign: {name} is {fmt(cust, unit)} for this customer. "
+                     f"A typical honest customer has {fmt(typ, unit)}.")
+    facts.append("These are warning signs, not proof. Someone should check the meter on site.")
+    return facts
+
+
+# ─────────────────────────────────────────────
 # Step 5: guardrails
 # ─────────────────────────────────────────────
-NUM_RE = re.compile(r"(?<![\w.])-?\d[\d,]*(?:\.\d+)?")
+NUM_RE = re.compile(r"(?<![\w.])-?\d[\d,]*(?:\.\d+)?(?![\w])")
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Phrases from the first TinyLlama run that were invented or described the file.
+BANNED = [
+    (r"\bjson\b", "talks about the JSON file"),
+    (r"\bsections?\b", "describes the file's sections"),
+    (r"\blanguage model\b|\bthe lm\b|\bllm\b", "mentions the language model"),
+    (r"\binstalled\b|\breported the theft\b|\brequested the investigation\b", "invents how the data was collected"),
+    (r"\bnew york\b|\bcity\b|\bresidential\b|\bproperty\b|\baddress\b", "invents a location"),
+    (r"\btrained\b|\btraining data\b", "invents training details"),
+    (r"\bnext \d+ days\b|\bwill (steal|commit)\b|\bfuture\b", "makes a prediction about the future"),
+    (r"\bthreshold\b", "uses a technical term (threshold)"),
+    (r"\blstm\b|\blightgbm\b|\bshap\b|\blog-odds\b|\bcorrelation\b|\bcoefficient\b", "uses a technical term"),
+]
+HIGHER = re.compile(r"\b(higher|more|above|greater|larger|bigger|exceed\w*|increase\w*)\b")
+LOWER = re.compile(r"\b(lower|less|below|smaller|fewer|decrease\w*|drop(ped)? below)\b")
 
 
-def numbers_in(obj):
+def numbers_in(obj, key=None):
+    """Numbers the text may use. Dates and the customer ID add none (dates are checked separately)."""
     out = set()
     if isinstance(obj, dict):
-        for v in obj.values():
-            out |= numbers_in(v)
+        for k, v in obj.items():
+            if k != "customer_id":
+                out |= numbers_in(v, k)
     elif isinstance(obj, list):
         for v in obj:
-            out |= numbers_in(v)
+            out |= numbers_in(v, key)
     elif isinstance(obj, bool):
         pass
     elif isinstance(obj, (int, float)):
@@ -298,62 +400,114 @@ def numbers_in(obj):
         if isinstance(obj, float) and 0 <= obj <= 1:      # allow probability as a percent
             out.add(round(obj * 100, 1))
             out.add(float(round(obj * 100)))
-    elif isinstance(obj, str):
-        for tok in NUM_RE.findall(obj):                    # dates, IDs
-            for part in re.split(r"[-/]", tok.replace(",", "")):
-                if part:
-                    out.add(float(part))
+    elif isinstance(obj, str) and not DATE_RE.fullmatch(obj):
+        for tok in NUM_RE.findall(obj):                    # e.g. "last 90 days", "Oct 2016"
+            out.add(float(tok.replace(",", "")))
     return out
+
+
+def _sentences(text):
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+
+
+def direction_problems(text, ev):
+    """A sentence that quotes the customer's value must not point the wrong way."""
+    pairs = []   # (customer value, comparison value)
+    for _, cust, typ, _ in warning_signs(ev):
+        pairs.append((cust, typ))
+    if ev.get("suspicious_periods"):
+        p = ev["suspicious_periods"][0]
+        pairs.append((p["average daily use in this period (kWh)"], p[OVERALL_KEY]))
+    probs = []
+    for sent in _sentences(text):
+        low = sent.lower()
+        nums = {float(t.replace(",", "")) for t in NUM_RE.findall(DATE_RE.sub(" ", sent))}
+        for cust, typ in pairs:
+            if cust == typ or not any(abs(n - cust) <= 0.011 for n in nums):
+                continue
+            if not any(abs(n - typ) <= 0.011 for n in nums):
+                continue          # only judge sentences that compare the two values
+            says_higher, says_lower = bool(HIGHER.search(low)), bool(LOWER.search(low))
+            if cust > typ and says_lower and not says_higher:
+                probs.append(f"says lower, but {cust} is higher than {typ}")
+            if cust < typ and says_higher and not says_lower:
+                probs.append(f"says higher, but {cust} is lower than {typ}")
+    return probs
 
 
 def check_text(text, evidence):
     """Return a list of problems (empty list = passes)."""
     problems = []
-    allowed = numbers_in(evidence) | {float(TOP_PERIODS), 1.0, 2.0, 3.0, 90.0, float(WINDOW_DAYS)}
-    for date in re.findall(r"\d{4}-\d{2}-\d{2}", text):
-        if date not in json.dumps(evidence):
+    ev_json = json.dumps(evidence)
+    allowed = numbers_in(evidence) | {1.0, 2.0, 3.0, 2014.0, 2015.0, 2016.0}
+    for date in DATE_RE.findall(text):
+        if date not in ev_json:
             problems.append(f"date not in evidence: {date}")
-    text_no_dates = re.sub(r"\d{4}-\d{2}-\d{2}", " ", text)
-    for tok in NUM_RE.findall(text_no_dates):
+    for tok in NUM_RE.findall(DATE_RE.sub(" ", text)):
         v = float(tok.replace(",", ""))
         if not any(abs(v - a) <= max(0.011, 0.005 * abs(a)) for a in allowed):
             problems.append(f"number not in evidence: {tok}")
     low = text.lower()
+    for pattern, why in BANNED:
+        if re.search(pattern, low):
+            problems.append(why)
     flagged = evidence["decision"].startswith("flagged")
-    if flagged and re.search(r"\b(not (a )?(theft|suspicious|flagged)|no (evidence of )?theft|is normal)\b", low):
+    if flagged and re.search(r"\b(not (a )?(theft|thief|suspicious|flagged)|no (evidence of )?theft|"
+                             r"is normal|has been normal|(usage|use|behaviou?r) (was|is|has been) normal)\b", low):
         problems.append("text contradicts the detector's decision")
     if not flagged and re.search(r"\b(is|was) (committing|stealing)\b", low):
         problems.append("text contradicts the detector's decision")
-    if len(text.split()) < 25:
+    problems += direction_problems(text, evidence)
+    # Must carry the key evidence, not just generic words.
+    periods = evidence.get("suspicious_periods") or []
+    if periods and periods[0]["start_date"] not in text:
+        problems.append("does not mention the most suspicious period")
+    signs = warning_signs(evidence)
+    if signs and not any(re.search(rf"(?<![\d.]){re.escape(str(c))}(?![\d])", text) for _, c, _, _ in signs):
+        problems.append("does not mention any warning sign value")
+    if not re.search(r"\b(inspect\w*|check\w*|visit\w*|confirm\w*)\b", low):
+        problems.append("does not recommend an on-site check")
+    if not text.rstrip().endswith((".", "!", "?")):
+        problems.append("stops mid-sentence")
+    n_words = len(text.split())
+    if n_words < 25:
         problems.append("too short")
+    if n_words > 160:
+        problems.append("too long")
     return problems
 
 
 # ─────────────────────────────────────────────
-# Step 4: writers
+# Step 4b: writers
 # ─────────────────────────────────────────────
 def template_writer(ev):
-    pct = round(ev["theft_probability"] * 100)
-    who = "the detector (an LSTM and a feature model combined)" if "lstm_theft_probability" in ev else "the LSTM detector"
-    lines = [f"Customer {ev['customer_id']} was {ev['decision']} by {who}, "
-             f"with an estimated theft probability of {pct}%."]
-    if ev["suspicious_periods"]:
-        p = ev["suspicious_periods"][0]
-        lines.append(
-            f"The period that most influenced this decision was {p['start_date']} to {p['end_date']}, "
-            f"when average use was {p['average daily use in this period (kWh)']} kWh per day compared with "
-            f"this customer's usual {p[OVERALL_KEY]} kWh.")
-    if "features_that_pushed_toward_theft" in ev:
-        for c in ev["features_that_pushed_toward_theft"][:3]:
-            lines.append(f"A warning sign is \"{c['feature']}\": {c['customer_value']} for this customer, "
-                         f"against {c['typical_normal_customer_value']} for a typical normal customer.")
-    unusual = [c for c in ev.get("comparison_with_normal_customers", []) if c["unusual"]][:3]
-    for c in unusual:
-        direction = "higher" if c["percentile_among_normal_customers"] >= 50 else "lower"
-        lines.append(f"For \"{c['feature']}\" this customer has {c['customer_value']}, {direction} than most "
-                     f"normal customers (typical value {c['typical_normal_customer_value']}).")
-    lines.append("This is a statistical warning sign, not proof of theft; an on-site inspection should confirm it.")
-    return " ".join(lines)
+    """Fallback: plain, short sentences built only from the evidence."""
+    return " ".join(evidence_facts(ev))
+
+
+EXAMPLE_FACTS = [
+    "The detector flagged this customer as a possible electricity thief.",
+    "The detector is 97% sure.",
+    "The most suspicious time was 2015-03-04 to 2015-03-31.",
+    "In that time the customer used 1.2 kWh a day. Their usual use is 14.6 kWh a day.",
+    "Warning sign: longest run of days with no use is 41 days for this customer. A typical honest customer has 2 days.",
+    "Warning sign: use in the last 90 days, as a % of their usual use is 12.5% for this customer. A typical honest customer has 101.3%.",
+    "These are warning signs, not proof. Someone should check the meter on site.",
+]
+EXAMPLE_ANSWER = (
+    "This customer has been flagged as a possible electricity thief, and the system is 97% sure. "
+    "From 2015-03-04 to 2015-03-31 they used only 1.2 kWh a day, far less than their usual 14.6 kWh. "
+    "They also went 41 days in a row with no use, while a typical honest customer has 2 such days. "
+    "In the last 90 days they used 12.5% of their usual amount, against 101.3% for a typical honest customer. "
+    "These are warning signs, not proof, so someone should check the meter on site."
+)
+SYSTEM_PROMPT = (
+    "You write short notes for electricity inspectors who are not technical. "
+    "Rewrite the facts you are given as one short paragraph of 4 to 6 plain sentences. "
+    "Rules: use only the facts given; copy every number and date exactly; do not add any other "
+    "information; do not explain how the detector works; do not use technical words; keep each "
+    "sentence under 25 words; end by saying someone should check the meter on site."
+)
 
 
 class LLMWriter:
@@ -369,28 +523,29 @@ class LLMWriter:
         self.model = model.to(device).eval()
         self.device = device
         # Set the generation options on the model itself. Newer transformers merge
-        # any passed settings with the model's stored defaults, so TinyLlama's own
-        # max_length (2048) and sampling options must be cleared here; otherwise
-        # every call prints "Both max_new_tokens and max_length seem to have been set".
+        # any passed settings with the model's stored defaults, so the model's own
+        # max_length and sampling options must be cleared here; otherwise every call
+        # prints "Both max_new_tokens and max_length seem to have been set".
         gc = self.model.generation_config
         gc.max_length = None
-        gc.max_new_tokens = 220
+        gc.max_new_tokens = 200
         gc.do_sample = False
         gc.temperature = None
         gc.top_p = None
         gc.top_k = None
-        gc.repetition_penalty = 1.1
-        gc.pad_token_id = self.tok.eos_token_id
+        gc.repetition_penalty = 1.05
+        gc.pad_token_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.tok.eos_token_id
 
     def __call__(self, ev, strict=False):
-        rules = ("Use ONLY facts and numbers from the JSON. Do not invent numbers. Do not change the "
-                 "decision. Write 3-5 short sentences for a utility inspector with no technical background. "
-                 "Mention the most suspicious period and the strongest warning signs. End by saying an "
-                 "inspection is needed to confirm.")
+        system = SYSTEM_PROMPT
         if strict:
-            rules += " Copy numbers exactly as written in the JSON. Do not do any arithmetic."
-        msgs = [{"role": "system", "content": "You explain the output of an electricity theft detector. " + rules},
-                {"role": "user", "content": "Evidence JSON:\n" + json.dumps(ev, indent=1) + "\n\nExplanation:"}]
+            system += " Your last answer broke these rules. Keep it simpler and closer to the facts."
+        facts = "\n".join(f"- {f}" for f in evidence_facts(ev))
+        example = "\n".join(f"- {f}" for f in EXAMPLE_FACTS)
+        msgs = [{"role": "system", "content": system},
+                {"role": "user", "content": "Facts:\n" + example},
+                {"role": "assistant", "content": EXAMPLE_ANSWER},
+                {"role": "user", "content": "Facts:\n" + facts}]
         # return_dict=True gives the same dict (input_ids + attention_mask) in old and new
         # transformers versions; newer versions return a dict even without it.
         enc = self.tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt",
@@ -402,14 +557,24 @@ class LLMWriter:
         return self.tok.decode(out[0, n_prompt:], skip_special_tokens=True).strip()
 
 
+def trim_to_sentence(text):
+    """Cut a reply that ran out of tokens back to its last full sentence."""
+    text = text.strip()
+    if text.endswith((".", "!", "?")):
+        return text
+    cut = max(text.rfind(". "), text.rfind("! "), text.rfind("? "))
+    return text[:cut + 1] if cut > 0 else text
+
+
 def narrate(ev, llm):
     """LLM first (2 tries), template if the guardrails reject both."""
     attempts = []
     if llm is not None:
         for strict in (False, True):
-            text = llm(ev, strict=strict)
+            raw = llm(ev, strict=strict)
+            text = trim_to_sentence(raw)
             problems = check_text(text, ev)
-            attempts.append({"text": text, "problems": problems})
+            attempts.append({"text": text, "raw": raw, "problems": problems})
             if not problems:
                 return text, "llm", attempts
     text = template_writer(ev)
@@ -588,6 +753,9 @@ def main():
         "deletion_test_mean_logodds_drop_random_periods": float(np.mean(del_rand)),
         "deletion_test_top_beats_random_frac": float(np.mean(np.array(del_top) > np.array(del_rand))),
         "mode": "ensemble" if fm else "lstm",
+        "llm_problem_counts": dict(collections.Counter(
+            re.sub(r":.*", "", pr) for r_ in records for att in r_["llm_attempts"] for pr in att["problems"]
+        ).most_common()),
     }
     if fm is not None:
         summary["feature_deletion_mean_logodds_drop_top3"] = float(np.mean(fdel_top))

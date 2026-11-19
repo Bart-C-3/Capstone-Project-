@@ -111,3 +111,35 @@ Faithfulness checks (40 most confident flags, template writer):
 - Features: resetting the top 3 to typical normal values lowers LightGBM's log-odds by 2.56 vs 0.13 for 3 random features (top wins in 40/40).
 
 Note for the report: many of the most confident flags are very large consumers (e.g. 156 kWh/day against 5.5 for a typical normal customer), and "high usage" is often the top feature. That is what the model learned from SGCC's labels, and the explanation shows it faithfully. It is worth discussing as a possible bias in the dataset, rather than hiding it.
+
+## Narrator v2: plain facts in, stricter guardrails out
+
+The first TinyLlama run (20 customers) passed the old guardrails 95% of the time, but reading the texts showed they were not usable:
+- they described the JSON file ("The first section of the JSON file describes…");
+- they invented facts ("a residential property located in the city of New York", "trained using data from January 2016 to March 2016", "predicts theft in the next 29 days");
+- one said the LSTM predicted usage "has been normal" when it gave 0.99 theft;
+- all 20 stopped mid-sentence.
+
+The old guardrails only checked numbers, dates and a few contradiction phrases, so these errors passed.
+
+Changes in `12_explain_hybrid.py`:
+- **Input to the LLM:** short plain fact sentences built from the evidence (no JSON), plus one worked example to copy. Feature names are shortened to everyday words.
+- **New guardrails**, on top of the number and date checks:
+  - rejects talk of the JSON file, its sections or the "language model";
+  - rejects invented locations, data collection, training details and future predictions;
+  - rejects jargon (LSTM, threshold, correlation…);
+  - rejects wrong "higher/lower" claims about the customer's values;
+  - requires the main suspicious period, at least one warning-sign value and an on-site check;
+  - requires 25–160 words ending in a full sentence. Cut-off replies are first trimmed to their last full sentence.
+- **Template fallback** now writes the same plain style: readability score 74, against 61 before and 42 for TinyLlama's first run.
+- `explanation_eval.json` now has `llm_problem_counts`: why LLM attempts were rejected.
+
+Re-checking the 20 first-run TinyLlama texts with the new guardrails: **20/20 rejected**. Most common reasons:
+- talks about the JSON file (20)
+- no suspicious period (20)
+- no on-site check (19)
+- jargon (18)
+- no warning-sign value (18)
+- mentions the language model (15)
+
+The new prompt has not yet been run with the real TinyLlama (it can't be downloaded in the sandbox). If its pass rate stays low, try `--llm-id Qwen/Qwen2.5-1.5B-Instruct`, which fits on an 8 GB GPU.
