@@ -344,6 +344,15 @@ def warning_signs(ev, k=3):
     return out
 
 
+def _more_less(a, b, up, down):
+    if a == b:
+        return "no different"
+    ratio = a / b if b else float("inf")
+    if a > b:
+        return f"much {up}" if ratio >= 2 else up
+    return f"much {down}" if ratio <= 0.5 else down
+
+
 def evidence_facts(ev):
     pct = round(ev["theft_probability"] * 100)
     flagged = ev["decision"].startswith("flagged")
@@ -353,11 +362,13 @@ def evidence_facts(ev):
     if ev.get("suspicious_periods"):
         p = ev["suspicious_periods"][0]
         facts.append(f"The most suspicious time was {p['start_date']} to {p['end_date']}.")
-        facts.append(f"In that time the customer used {p['average daily use in this period (kWh)']} kWh a day. "
-                     f"Their usual use is {p[OVERALL_KEY]} kWh a day.")
+        a, b = p["average daily use in this period (kWh)"], p[OVERALL_KEY]
+        facts.append(f"In that time the customer used {a} kWh a day. "
+                     f"That is {_more_less(a, b, 'more', 'less')} than their usual {b} kWh a day.")
     for name, cust, typ, unit in warning_signs(ev):
-        facts.append(f"Warning sign: {name} is {fmt(cust, unit)} for this customer. "
-                     f"A typical honest customer has {fmt(typ, unit)}.")
+        facts.append(f"Warning sign: {name} is {fmt(cust, unit)} for this customer. That is "
+                     f"{_more_less(cust, typ, 'higher', 'lower')} than a typical honest customer, "
+                     f"who has {fmt(typ, unit)}.")
     facts.append("These are warning signs, not proof. Someone should check the meter on site.")
     return facts
 
@@ -378,7 +389,12 @@ BANNED = [
     (r"\bnext \d+ days\b|\bwill (steal|commit)\b|\bfuture\b", "makes a prediction about the future"),
     (r"\bthreshold\b", "uses a technical term (threshold)"),
     (r"\blstm\b|\blightgbm\b|\bshap\b|\blog-odds\b|\bcorrelation\b|\bcoefficient\b", "uses a technical term"),
+    (r"kwh in a row|\bwent \d[\d.,]* kwh|kwh[^.]{0,30}without using", "describes kWh as a run of days"),
 ]
+COMPARE_RE = re.compile(r"\b(more|higher|greater|larger|bigger|less|lower|smaller|fewer)\s+than\b")
+MULT_RE = re.compile(r"^\s*(twice|double|(\w+|\d+(?:\.\d+)?) times)\b")
+WORD_NUM = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+            "ten": 10, "twenty": 20, "fifty": 50, "hundred": 100}
 HIGHER = re.compile(r"\b(higher|more|above|greater|larger|bigger|exceed\w*|increase\w*)\b")
 LOWER = re.compile(r"\b(lower|less|below|smaller|fewer|decrease\w*|drop(ped)? below)\b")
 
@@ -435,6 +451,75 @@ def direction_problems(text, ev):
     return probs
 
 
+def value_roles(ev):
+    """Numbers that belong to this customer vs to the typical honest customer."""
+    cust, typ = set(), set()
+    if ev.get("suspicious_periods"):
+        p = ev["suspicious_periods"][0]
+        cust |= {float(p["average daily use in this period (kWh)"]), float(p[OVERALL_KEY])}
+    for _, c, t, _ in warning_signs(ev, k=10):
+        cust.add(float(c))
+        typ.add(float(t))
+    return cust, typ
+
+
+def _close(v, pool):
+    return any(abs(v - a) <= max(0.011, 0.005 * abs(a)) for a in pool)
+
+
+def _nums(fragment):
+    return [float(t.replace(",", "")) for t in NUM_RE.findall(DATE_RE.sub(" ", fragment))]
+
+
+def comparison_problems(text, ev):
+    """Every "X ... more/less than [N times] Y" must be true for the numbers it compares."""
+    cust, typ = value_roles(ev)
+    usual = None
+    if ev.get("suspicious_periods"):
+        usual = float(ev["suspicious_periods"][0][OVERALL_KEY])
+    probs = []
+    for sent in _sentences(text):
+        low = sent.lower()
+        for m in COMPARE_RE.finditer(low):
+            before, after = low[:m.start()], low[m.end():]
+            xs = _nums(before)
+            if not xs:
+                continue
+            x = xs[-1]
+            factor = 1.0
+            mm = MULT_RE.match(after)
+            if mm:
+                w = mm.group(1)
+                if w in ("twice", "double"):
+                    factor = 2.0
+                else:
+                    k = mm.group(2)
+                    factor = float(k) if re.fullmatch(r"\d+(?:\.\d+)?", k) else float(WORD_NUM.get(k, 1))
+                after = after[mm.end():]
+            ys = _nums(after.split(",")[0]) or _nums(after)
+            if ys:
+                y = ys[0]
+            elif usual is not None and re.match(r"\s*(that of )?their (usual|typical|normal|average)", after):
+                y = usual
+            else:
+                continue
+            up = m.group(1) in ("more", "higher", "greater", "larger", "bigger")
+            if up and not x > factor * y:
+                probs.append(f"says {x} is {'%g times ' % factor if factor > 1 else ''}more than {y}")
+            if not up and not x < y:
+                probs.append(f"says {x} is less than {y}")
+            if "slightly" in before[-25:] and y and not (0.7 <= x / y <= 1.4):
+                probs.append(f"calls the gap between {x} and {y} slight")
+    # "their usual/typical ... N" must be this customer's own value
+    for sent in _sentences(text):
+        # look only at the few words right after "their usual", up to a comma
+        for m in re.finditer(r"\btheir (usual|typical|normal|average)\b((?:\s+[^\s,;]+){0,5})", sent.lower()):
+            ns = _nums(m.group(2))
+            if ns and _close(ns[0], typ) and not _close(ns[0], cust):
+                probs.append(f"calls {ns[0]} 'their {m.group(1)}', but it is a typical honest customer's value")
+    return probs
+
+
 def check_text(text, evidence):
     """Return a list of problems (empty list = passes)."""
     problems = []
@@ -458,6 +543,7 @@ def check_text(text, evidence):
     if not flagged and re.search(r"\b(is|was) (committing|stealing)\b", low):
         problems.append("text contradicts the detector's decision")
     problems += direction_problems(text, evidence)
+    problems += comparison_problems(text, evidence)
     # Must carry the key evidence, not just generic words.
     periods = evidence.get("suspicious_periods") or []
     if periods and periods[0]["start_date"] not in text:
@@ -489,23 +575,26 @@ EXAMPLE_FACTS = [
     "The detector flagged this customer as a possible electricity thief.",
     "The detector is 97% sure.",
     "The most suspicious time was 2015-03-04 to 2015-03-31.",
-    "In that time the customer used 1.2 kWh a day. Their usual use is 14.6 kWh a day.",
-    "Warning sign: longest run of days with no use is 41 days for this customer. A typical honest customer has 2 days.",
-    "Warning sign: use in the last 90 days, as a % of their usual use is 12.5% for this customer. A typical honest customer has 101.3%.",
+    "In that time the customer used 3.2 kWh a day. That is much less than their usual 14.6 kWh a day.",
+    "Warning sign: highest daily use is 96.4 kWh for this customer. That is much higher than a typical "
+    "honest customer, who has 18.3 kWh.",
+    "Warning sign: average daily use in the last 90 days is 9.1 kWh for this customer. That is higher than "
+    "a typical honest customer, who has 6.2 kWh.",
     "These are warning signs, not proof. Someone should check the meter on site.",
 ]
 EXAMPLE_ANSWER = (
     "This customer has been flagged as a possible electricity thief, and the system is 97% sure. "
-    "From 2015-03-04 to 2015-03-31 they used only 1.2 kWh a day, far less than their usual 14.6 kWh. "
-    "They also went 41 days in a row with no use, while a typical honest customer has 2 such days. "
-    "In the last 90 days they used 12.5% of their usual amount, against 101.3% for a typical honest customer. "
+    "From 2015-03-04 to 2015-03-31 they used 3.2 kWh a day, much less than their usual 14.6 kWh. "
+    "Their highest daily use was 96.4 kWh, much higher than the 18.3 kWh of a typical honest customer. "
+    "In the last 90 days they used 9.1 kWh a day, higher than the 6.2 kWh of a typical honest customer. "
     "These are warning signs, not proof, so someone should check the meter on site."
 )
 SYSTEM_PROMPT = (
     "You write short notes for electricity inspectors who are not technical. "
     "Rewrite the facts you are given as one short paragraph of 4 to 6 plain sentences. "
-    "Rules: use only the facts given; copy every number and date exactly; do not add any other "
-    "information; do not explain how the detector works; do not use technical words; keep each "
+    "Rules: use only the facts given; copy every number and date exactly; copy the words "
+    "'more', 'less', 'higher' and 'lower' from the facts and never change them; do not add any other "
+    "information; do not calculate anything; do not explain how the detector works; do not use technical words; keep each "
     "sentence under 25 words; end by saying someone should check the meter on site."
 )
 

@@ -143,3 +143,23 @@ Re-checking the 20 first-run TinyLlama texts with the new guardrails: **20/20 re
 - mentions the language model (15)
 
 The new prompt has not yet been run with the real TinyLlama (it can't be downloaded in the sandbox). If its pass rate stays low, try `--llm-id Qwen/Qwen2.5-1.5B-Instruct`, which fits on an 8 GB GPU.
+
+### Narrator v2.1: second TinyLlama run
+
+With narrator v2, TinyLlama's text was kept for 9 of 20 customers and every text read as plain English (readability 71–91). Reading those 9 still showed wrong statements that the checks missed, for example:
+- "1012.39 kWh, which is less than … 459.97"
+- "53.93 … more than twice their usual 29.62"
+- "much higher than their typical daily use of 21.97 kWh" (21.97 is a typical honest customer's value, not this customer's)
+- "went 7854.0 kWh in a row"
+- "179.94 kWh, slightly higher than 5.41"
+
+Changes:
+- The fact sentences now carry the direction ("That is much less than their usual 156.13 kWh a day"), so the model copies it instead of guessing.
+- The worked example uses kWh warning signs like the real evidence, with no "in a row" phrasing to imitate.
+- New checks:
+  - every "X … more/less than [twice / N times] Y" must hold for the two numbers;
+  - "their usual/typical …" must be followed by the customer's own value;
+  - "slightly" is only allowed for small gaps;
+  - "kWh in a row" and "went N kWh" are banned.
+
+Re-checking the 9 texts that passed v2: **all 9 are now rejected**, each for at least one of the errors above. A correct plain-English text still passes, and the template passes for all 40 test customers (readability 78).
